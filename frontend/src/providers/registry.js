@@ -17,7 +17,7 @@ export const PROVIDERS = {
   },
   flagsmith: {
     id: 'flagsmith',
-    label: 'Flagsmith (Hosted API)',
+    label: 'Flagsmith (Offline JSON)',
     init: initFlagsmith,
   },
   launchdarkly: {

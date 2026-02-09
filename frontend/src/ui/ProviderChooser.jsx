@@ -58,9 +58,9 @@ export default function ProviderChooser({ onChosen }) {
                   {p.id === 'growthbook' &&
                     'Evaluates flags locally from /growthbook/features.json.'}
                   {p.id === 'flagsmith' &&
-                    'Evaluates via Flagsmith Hosted API using your Environment ID.'}
+                    'Evaluates via Flagsmith Using Json File.'}
                   {p.id === 'launchdarkly' &&
-                    'Evaluates via backend using LaunchDarkly offline file datasource (no cloud).'}
+                    'Evaluates via backend using LaunchDarkly offline json file.'}
                 </div>
               </div>
             </label>

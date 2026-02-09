@@ -40,20 +40,14 @@
       "value": true,
       "segment_id": 10
     },
-
+ 
     {
       "feature_id": 2,
       "enabled": true,
       "value": "blue",
       "segment_id": null
     },
-    {
-      "feature_id": 2,
-      "enabled": true,
-      "value": "green",
-      "segment_id": 10
-    },
-    
+ 
     {
       "feature_id": 3,
       "enabled": false,
