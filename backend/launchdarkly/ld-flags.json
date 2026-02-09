@@ -1,0 +1,35 @@
+{
+  "flags": {
+    "new-badge": {
+      "key": "new-badge",
+      "version": 1,
+      "on": true,
+      "variations": [true, false],
+      "targets": [
+        { "values": ["pradyun"], "variation": 0 }
+      ],
+      "fallthrough": { "variation": 1 },
+      "offVariation": 1
+    },
+    "cta-color": {
+      "key": "cta-color",
+      "version": 1,
+      "on": true,
+      "variations": ["blue", "green"],
+      "fallthrough": { "variation": 0},
+      "offVariation": 0
+    },
+    "api-new-endpoint-enabled": {
+      "key": "api-new-endpoint-enabled",
+      "version": 1,
+      "on": true,
+      "variations": [true, false],
+      "targets": [
+        { "values": ["pradyun"], "variation": 0 }
+      ],
+      "fallthrough": { "variation": 1 },
+      "offVariation": 1
+    }
+  },
+  "segments": {}
+}

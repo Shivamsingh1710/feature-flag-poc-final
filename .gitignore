@@ -1,0 +1,88 @@
+# --- Node.js dependencies ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# If you DO want to commit lockfiles, comment out the three lines above.
+
+# --- Build outputs / dist artifacts ---
+dist/
+build/
+out/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+storybook-static/
+
+# --- Testing / coverage ---
+coverage/
+.nyc_output/
+.playwright/
+.cypress/
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Tooling caches ---
+.cache/
+.tmp/
+temp/
+tmp/
+.eslintcache
+.stylelintcache
+tsconfig.tsbuildinfo
+
+# --- TypeScript ---
+*.tsbuildinfo
+
+# --- Logs ---
+logs/
+*.log
+*.log.*
+
+# --- VS Code ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# If you prefer to ignore all VS Code settings, remove the four exceptions above.
+
+# --- OS / Editor junk ---
+.DS_Store
+Thumbs.db
+Icon?
+ehthumbs.db
+.Spotlight-V100
+.Trashes
+
+# --- Monorepo / Workspaces (Lerna/Turbo/Nx) ---
+.pnp/
+.pnp.cjs
+.pnpm-store/
+.turbo/
+nx-out/
+.project.json
+node_modules/.cache/
+
+# --- Docker ---
+docker-data/
+**/.dockerignore
+
+# --- Misc ---
+*.swp
+*.swo
+*.orig
+*.rej
+
+# --- Optional: if you build docs ---
+.docusaurus/

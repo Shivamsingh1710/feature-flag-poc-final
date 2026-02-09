@@ -1,0 +1,8 @@
+{
+  "flags": {
+    "new-badge": { "enabled": true, "value": true },
+    "cta-color": { "enabled": true, "value": "green" },
+    "api-new-endpoint-enabled": { "enabled": true, "value": false }
+  },
+  "traits": {}
+}

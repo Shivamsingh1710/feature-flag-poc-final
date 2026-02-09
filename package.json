@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@growthbook/growthbook": "^1.6.4",
+    "@openfeature/flagd-web-provider": "^0.7.3",
+    "@openfeature/web-sdk": "^1.7.2",
+    "flagsmith": "^10.0.0"
+  }
+}

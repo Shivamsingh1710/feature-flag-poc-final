@@ -1,0 +1,17 @@
+{
+  "new-badge": {
+    "defaultValue": false,
+    "rules": [
+      { "condition": { "userId": "pradyun" }, "force": true }
+    ]
+  },
+  "cta-color": {
+    "defaultValue": "blue"
+  },
+  "api-new-endpoint-enabled": {
+    "defaultValue": false,
+    "rules": [
+      { "condition": { "userId": "pradyun" }, "force": true }
+    ]
+  }
+}

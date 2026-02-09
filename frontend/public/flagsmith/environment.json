@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "project": {
+    "id": 1000,
+    "name": "Local Demo Project"
+  },
+  "features": [
+    { "id": 1, "name": "new-badge", "type": "FLAG" },
+    { "id": 2, "name": "cta-color", "type": "CONFIG" },
+    { "id": 3, "name": "api-new-endpoint-enabled", "type": "FLAG" }
+  ],
+  "segments": [
+    {
+      "id": 10,
+      "name": "userId_is_pradyun",
+      "rules": [
+        {
+          "type": "ALL",
+          "conditions": [
+            {
+              "operator": "EQUAL",
+              "property": "userId",
+              "value": "pradyun"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "feature_states": [
+    {
+      "feature_id": 1,
+      "enabled": false,
+      "value": false,
+      "segment_id": null
+    },
+    {
+      "feature_id": 1,
+      "enabled": true,
+      "value": true,
+      "segment_id": 10
+    },
+
+    {
+      "feature_id": 2,
+      "enabled": true,
+      "value": "blue",
+      "segment_id": null
+    },
+    {
+      "feature_id": 2,
+      "enabled": true,
+      "value": "green",
+      "segment_id": 10
+    },
+    
+    {
+      "feature_id": 3,
+      "enabled": false,
+      "value": false,
+      "segment_id": null
+    },
+    {
+      "feature_id": 3,
+      "enabled": true,
+      "value": true,
+      "segment_id": 10
+    }
+  ]
+}
