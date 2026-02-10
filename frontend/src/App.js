@@ -1,63 +1,101 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { OpenFeature, ProviderEvents } from '@openfeature/web-sdk';
 import { initOpenFeature } from './openfeature';
+import { reloadGrowthBookFeatures } from './providers/growthbook';
+import { reloadFlagsmithEnvironment } from './providers/flagsmith';
 
 export default function App() {
-  const [ofClient, setOfClient] = useState(null);
   const [userId, setUserId] = useState('anonymous');
   const [flags, setFlags] = useState({ newBadge: false, ctaColor: 'blue' });
+
+  // Keep the OpenFeature client in a ref to avoid stale closures in event handlers
+  const clientRef = useRef(null);
+
   const apiBase = 'http://localhost:8000';
   const providerChoice = localStorage.getItem('providerChoice') || 'flagd';
 
+  // Refresh FE flags using per-call context to avoid races with onContextChange
   const refreshFE = useCallback(async () => {
-    if (!ofClient) return;
-    const newBadge = await ofClient.getBooleanValue('new-badge', false);
-    const ctaColor = await ofClient.getStringValue('cta-color', 'blue');
+    const client = clientRef.current;
+    if (!client) return;
+
+    const ctx = { targetingKey: userId, userId }; // per-call context
+    const newBadge = await client.getBooleanValue('new-badge', false, ctx);
+    const ctaColor = await client.getStringValue('cta-color', 'blue', ctx);
     setFlags({ newBadge, ctaColor });
-  }, [ofClient]);
+  }, [userId]);
 
-  const refreshBE = useCallback(async (uid) => {
-    try {
-      const r = await fetch(
-        `${apiBase}/api/flags?userId=${encodeURIComponent(uid)}&provider=${encodeURIComponent(providerChoice)}`
-      );
-      await r.json();
-    } catch {
-      // ignore (backend may be using a different provider or be offline)
-    }
-  }, [providerChoice]);
+  // Ping backend flags (used by the LD-backend provider and for parity checks)
+  const refreshBE = useCallback(
+    async (uid) => {
+      try {
+        const r = await fetch(
+          `${apiBase}/api/flags?userId=${encodeURIComponent(uid)}&provider=${encodeURIComponent(providerChoice)}`
+        );
+        await r.json();
+      } catch {
+        // ignore (backend may be using a different provider or be offline)
+      }
+    },
+    [providerChoice]
+  );
 
+  // Set user and refresh both FE + BE
   const setUserAndRefresh = useCallback(async () => {
-    // Set BOTH targetingKey (for flagd/OpenFeature targeting) and userId (for other providers)
+    // 1) For GB & Flagsmith, explicitly reload their JSON so FE gets latest file
+    if (providerChoice === 'growthbook') {
+      await reloadGrowthBookFeatures();
+    } else if (providerChoice === 'flagsmith') {
+      await reloadFlagsmithEnvironment();
+    }
+    // 2) Update global context (good hygiene for all providers)
     await OpenFeature.setContext({ targetingKey: userId, userId });
-
+    // 3) Re-evaluate immediately (per-call context avoids race)
     await refreshFE();
     await refreshBE(userId);
-  }, [userId, refreshFE, refreshBE]);
+  }, [userId, providerChoice, refreshFE, refreshBE]);
 
   useEffect(() => {
+    let removeReady;
+    let removeChanged;
+    let cancelled = false;
+
     (async () => {
-      const client = await initOpenFeature(); // picks the chosen provider
-      setOfClient(client);
+      // Initialize provider chosen in the chooser
+      const client = await initOpenFeature();
+      if (cancelled) return;
+      clientRef.current = client;
 
       // Set initial context
       await OpenFeature.setContext({ targetingKey: 'anonymous', userId: 'anonymous' });
+      if (cancelled) return;
 
+      // Initial refresh (FE first so UI syncs right away) using per-call context
       await refreshFE();
       await refreshBE('anonymous');
+      if (cancelled) return;
 
-      const onReady = () => refreshFE();
-      const onChanged = () => refreshFE();
-      const h1 = OpenFeature.addHandler?.(ProviderEvents.Ready, onReady);
-      const h2 = OpenFeature.addHandler?.(ProviderEvents.ConfigurationChanged, onChanged);
-
-      return () => {
-        h1?.remove?.();
-        h2?.remove?.();
+      // Subscribe to provider lifecycle events; use ref-based refresh; per-call context inside refreshFE
+      const onReady = () => {
+        // Some providers emit Ready immediately; microtask tick + refresh to be safe
+        Promise.resolve().then(() => refreshFE());
       };
+      const onChanged = () => {
+        refreshFE();
+      };
+
+      removeReady = OpenFeature.addHandler?.(ProviderEvents.Ready, onReady);
+      removeChanged = OpenFeature.addHandler?.(ProviderEvents.ConfigurationChanged, onChanged);
     })();
+
+    // Proper cleanup returned directly from useEffect
+    return () => {
+      cancelled = true;
+      try { removeReady?.remove?.(); } catch {}
+      try { removeChanged?.remove?.(); } catch {}
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, []); // run once on mount
 
   // Small helper to add an 8s timeout + consistent error surface
   async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {

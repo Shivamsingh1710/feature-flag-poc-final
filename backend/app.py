@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Dict, Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 # -----------------------------
 # Load backend/.env reliably
@@ -41,10 +42,10 @@ LD_FLAGS_FILE = os.getenv("LD_FLAGS_FILE", "./launchdarkly/ld-flags.json")
 
 # GrowthBook & Flagsmith files (backend will read these directly)
 GROWTHBOOK_FEATURES_FILE = os.getenv(
-    "GROWTHBOOK_FEATURES_FILE", "../frontend/public/growthbook/features.json"
+    "GROWTHBOOK_FEATURES_FILE", "growthbook/features.json"
 )
 FLAGSMITH_ENV_FILE = os.getenv(
-    "FLAGSMITH_ENV_FILE", "../frontend/public/flagsmith/environment.json"
+    "FLAGSMITH_ENV_FILE", "flagsmith/environment.json"
 )
 
 # Normalize file paths to absolute
@@ -338,6 +339,18 @@ def ff_str(flag_key: str, default: str, user_id: str, provider: Optional[str] = 
 # FastAPI app
 # -----------------------------
 app = FastAPI()
+
+app.mount(
+    "/static/growthbook",
+    StaticFiles(directory=BASE_DIR / "growthbook"),
+    name="growthbook-static",
+)
+app.mount(
+    "/static/flagsmith",
+    StaticFiles(directory=BASE_DIR / "flagsmith"),
+    name="flagsmith-static",
+)
+
 
 # DEV: open CORS to avoid origin mismatches blocking your button clicks.
 # Once validated, you can revert to [FRONTEND_ORIGIN].
