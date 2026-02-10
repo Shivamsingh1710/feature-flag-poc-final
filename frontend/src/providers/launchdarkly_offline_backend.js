@@ -32,7 +32,7 @@ class BackendLDOfflineProvider {
 
   async _fetchFlags(context) {
     const userId = context?.userId || 'anonymous';
-    const url = `${this.apiBase}/api/flags?userId=${encodeURIComponent(userId)}`;
+    const url = `${this.apiBase}/api/flags?userId=${encodeURIComponent(userId)}&provider=launchdarkly`;
 
     try {
       const r = await fetch(url);
@@ -53,7 +53,6 @@ class BackendLDOfflineProvider {
 
       this._emit(ProviderEvents.ConfigurationChanged, {});
     } catch (e) {
-      // This is the exact case you're hitting: backend unreachable or CORS blocked
       console.warn(`[LD Offline Provider] Failed to fetch flags from ${url}`, e);
       // Do NOT throw; keep app usable (defaults will show)
     }

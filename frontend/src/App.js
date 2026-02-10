@@ -7,6 +7,7 @@ export default function App() {
   const [userId, setUserId] = useState('anonymous');
   const [flags, setFlags] = useState({ newBadge: false, ctaColor: 'blue' });
   const apiBase = 'http://localhost:8000';
+  const providerChoice = localStorage.getItem('providerChoice') || 'flagd';
 
   const refreshFE = useCallback(async () => {
     if (!ofClient) return;
@@ -17,12 +18,14 @@ export default function App() {
 
   const refreshBE = useCallback(async (uid) => {
     try {
-      const r = await fetch(`${apiBase}/api/flags?userId=${encodeURIComponent(uid)}`);
+      const r = await fetch(
+        `${apiBase}/api/flags?userId=${encodeURIComponent(uid)}&provider=${encodeURIComponent(providerChoice)}`
+      );
       await r.json();
     } catch {
-      // ignore (backend may be using a different provider)
+      // ignore (backend may be using a different provider or be offline)
     }
-  }, []);
+  }, [providerChoice]);
 
   const setUserAndRefresh = useCallback(async () => {
     // Set BOTH targetingKey (for flagd/OpenFeature targeting) and userId (for other providers)
@@ -45,15 +48,28 @@ export default function App() {
 
       const onReady = () => refreshFE();
       const onChanged = () => refreshFE();
-      OpenFeature.addHandler(ProviderEvents.Ready, onReady);
-      OpenFeature.addHandler(ProviderEvents.ConfigurationChanged, onChanged);
+      const h1 = OpenFeature.addHandler?.(ProviderEvents.Ready, onReady);
+      const h2 = OpenFeature.addHandler?.(ProviderEvents.ConfigurationChanged, onChanged);
 
       return () => {
-        OpenFeature.removeHandler?.(ProviderEvents.Ready, onReady);
-        OpenFeature.removeHandler?.(ProviderEvents.ConfigurationChanged, onChanged);
+        h1?.remove?.();
+        h2?.remove?.();
       };
     })();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Small helper to add an 8s timeout + consistent error surface
+  async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      return res;
+    } finally {
+      clearTimeout(id);
+    }
+  }
 
   return (
     <div style={{ padding: 24, fontFamily: 'system-ui, Arial, sans-serif' }}>
@@ -109,14 +125,29 @@ export default function App() {
       <h2 style={{ marginTop: 24 }}>Backend‑gated endpoints</h2>
       <div>
         <button onClick={async () => {
-          const r = await fetch(`${apiBase}/api/hello?userId=${encodeURIComponent(userId)}`);
-          alert(JSON.stringify(await r.json(), null, 2));
+          const url = `${apiBase}/api/hello?userId=${encodeURIComponent(userId)}&provider=${encodeURIComponent(providerChoice)}`;
+          try {
+            const r = await fetchWithTimeout(url);
+            const body = r.ok
+              ? await r.json()
+              : { error: `HTTP ${r.status}`, ...(await r.json().catch(() => ({}))) };
+            alert(JSON.stringify(body, null, 2));
+          } catch (err) {
+            alert(`Request failed: ${url}\n\n${err?.message || String(err)}`);
+          }
         }}>Call /api/hello</button>
 
         <button style={{ marginLeft: 8 }} onClick={async () => {
-          const r = await fetch(`${apiBase}/api/secret?userId=${encodeURIComponent(userId)}`);
-          const body = r.ok ? await r.json() : { error: `HTTP ${r.status}`, ...(await r.json().catch(() => ({}))) };
-          alert(JSON.stringify(body, null, 2));
+          const url = `${apiBase}/api/secret?userId=${encodeURIComponent(userId)}&provider=${encodeURIComponent(providerChoice)}`;
+          try {
+            const r = await fetchWithTimeout(url);
+            const body = r.ok
+              ? await r.json()
+              : { error: `HTTP ${r.status}`, ...(await r.json().catch(() => ({}))) };
+            alert(JSON.stringify(body, null, 2));
+          } catch (err) {
+            alert(`Request failed: ${url}\n\n${err?.message || String(err)}`);
+          }
         }}>Call /api/secret</button>
       </div>
     </div>
