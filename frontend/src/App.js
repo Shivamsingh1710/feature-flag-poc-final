@@ -1,59 +1,73 @@
+// frontend/src/App.js
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { OpenFeature, ProviderEvents } from '@openfeature/web-sdk';
-import { initOpenFeature } from './openfeature';
+import { initOpenFeature, reinitOpenFeature } from './openfeature';
 import { reloadGrowthBookFeatures } from './providers/growthbook';
 import { reloadFlagsmithEnvironment } from './providers/flagsmith';
+import { refreshFlagsmithOnline } from './providers/flagsmith_online';
 
 export default function App() {
   const [userId, setUserId] = useState('anonymous');
   const [flags, setFlags] = useState({ newBadge: false, ctaColor: 'blue' });
 
-  // Keep the OpenFeature client in a ref to avoid stale closures in event handlers
-  const clientRef = useRef(null);
+  const userIdRef = useRef(userId);
+  useEffect(() => { userIdRef.current = userId; }, [userId]);
 
   const apiBase = 'http://localhost:8000';
   const providerChoice = localStorage.getItem('providerChoice') || 'flagd';
 
-  // Refresh FE flags using per-call context to avoid races with onContextChange
+  const backendProviderFor = (choice) => {
+    if (choice === 'flagsmith-online') return 'flagsmith-online';
+    if (choice === 'flagsmith-offline') return 'flagsmith';
+    return choice;
+  };
+
   const refreshFE = useCallback(async () => {
-    const client = clientRef.current;
-    if (!client) return;
+    try {
+      const client = await OpenFeature.getClient('frontend'); // fetch fresh client every time
+      const uid = userIdRef.current;
+      const ctx = { targetingKey: uid, userId: uid };
+      const [newBadge, ctaColor] = await Promise.all([
+        client.getBooleanValue('new-badge', false, ctx),
+        client.getStringValue('cta-color', 'blue', ctx),
+      ]);
+      setFlags({ newBadge, ctaColor });
+      // eslint-disable-next-line no-console
+      console.log('[FE] refreshFE ->', { uid, newBadge, ctaColor });
+      if (typeof window !== 'undefined') window.__feLast = { uid, newBadge, ctaColor };
+    } catch (e) {
+      console.warn('[FE] refreshFE error:', e);
+    }
+  }, []);
 
-    const ctx = { targetingKey: userId, userId }; // per-call context
-    const newBadge = await client.getBooleanValue('new-badge', false, ctx);
-    const ctaColor = await client.getStringValue('cta-color', 'blue', ctx);
-    setFlags({ newBadge, ctaColor });
-  }, [userId]);
-
-  // Ping backend flags (used by the LD-backend provider and for parity checks)
   const refreshBE = useCallback(
     async (uid) => {
       try {
+        const provider = backendProviderFor(providerChoice);
         const r = await fetch(
-          `${apiBase}/api/flags?userId=${encodeURIComponent(uid)}&provider=${encodeURIComponent(providerChoice)}`
+          `${apiBase}/api/flags?userId=${encodeURIComponent(uid)}&provider=${encodeURIComponent(provider)}`
         );
         await r.json();
       } catch {
-        // ignore (backend may be using a different provider or be offline)
+        // ignore
       }
     },
     [providerChoice]
   );
 
-  // Set user and refresh both FE + BE
   const setUserAndRefresh = useCallback(async () => {
-    // 1) For GB & Flagsmith, explicitly reload their JSON so FE gets latest file
     if (providerChoice === 'growthbook') {
       await reloadGrowthBookFeatures();
-    } else if (providerChoice === 'flagsmith') {
+    } else if (providerChoice === 'flagsmith-offline') {
       await reloadFlagsmithEnvironment();
+    } else if (providerChoice === 'flagsmith-online') {
+      await refreshFlagsmithOnline();
     }
-    // 2) Update global context (good hygiene for all providers)
-    await OpenFeature.setContext({ targetingKey: userId, userId });
-    // 3) Re-evaluate immediately (per-call context avoids race)
+
+    await OpenFeature.setContext({ targetingKey: userIdRef.current, userId: userIdRef.current });
     await refreshFE();
-    await refreshBE(userId);
-  }, [userId, providerChoice, refreshFE, refreshBE]);
+    await refreshBE(userIdRef.current);
+  }, [providerChoice, refreshFE, refreshBE]);
 
   useEffect(() => {
     let removeReady;
@@ -62,42 +76,38 @@ export default function App() {
 
     (async () => {
       // Initialize provider chosen in the chooser
-      const client = await initOpenFeature();
+      try {
+        await initOpenFeature();
+      } catch (e) {
+        console.error('[App] initOpenFeature failed, falling back to flagd:', e);
+        // fallback to flagd so the app opens
+        localStorage.setItem('providerChoice', 'flagd');
+        await reinitOpenFeature();
+      }
       if (cancelled) return;
-      clientRef.current = client;
 
-      // Set initial context
-      await OpenFeature.setContext({ targetingKey: 'anonymous', userId: 'anonymous' });
+      await OpenFeature.setContext({ targetingKey: userIdRef.current, userId: userIdRef.current });
       if (cancelled) return;
 
-      // Initial refresh (FE first so UI syncs right away) using per-call context
       await refreshFE();
-      await refreshBE('anonymous');
+      await refreshBE(userIdRef.current);
       if (cancelled) return;
 
-      // Subscribe to provider lifecycle events; use ref-based refresh; per-call context inside refreshFE
-      const onReady = () => {
-        // Some providers emit Ready immediately; microtask tick + refresh to be safe
-        Promise.resolve().then(() => refreshFE());
-      };
-      const onChanged = () => {
-        refreshFE();
-      };
+      const onReady = () => Promise.resolve().then(() => refreshFE());
+      const onChanged = () => refreshFE();
 
       removeReady = OpenFeature.addHandler?.(ProviderEvents.Ready, onReady);
       removeChanged = OpenFeature.addHandler?.(ProviderEvents.ConfigurationChanged, onChanged);
     })();
 
-    // Proper cleanup returned directly from useEffect
     return () => {
       cancelled = true;
       try { removeReady?.remove?.(); } catch {}
       try { removeChanged?.remove?.(); } catch {}
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // run once on mount
+  }, []);
 
-  // Small helper to add an 8s timeout + consistent error surface
   async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -124,6 +134,14 @@ export default function App() {
         >
           Switch provider
         </button>
+      </div>
+
+      <div style={{ padding: 8, border: '1px solid #e5e7eb', borderRadius: 8, background: '#f8fafc', marginBottom: 12 }}>
+        <div style={{ fontSize: 13 }}>
+          <strong>Provider:</strong> {localStorage.getItem('providerChoice')}
+          {'  '}|{'  '}<strong>userId:</strong> {userId}
+          {'  '}|{'  '}<strong>FE reads:</strong> new-badge={String(flags.newBadge)}, cta-color={flags.ctaColor}
+        </div>
       </div>
 
       <div style={{ margin: '12px 0' }}>
@@ -163,7 +181,8 @@ export default function App() {
       <h2 style={{ marginTop: 24 }}>Backend‑gated endpoints</h2>
       <div>
         <button onClick={async () => {
-          const url = `${apiBase}/api/hello?userId=${encodeURIComponent(userId)}&provider=${encodeURIComponent(providerChoice)}`;
+          const provider = backendProviderFor(providerChoice);
+          const url = `${apiBase}/api/hello?userId=${encodeURIComponent(userIdRef.current)}&provider=${encodeURIComponent(provider)}`;
           try {
             const r = await fetchWithTimeout(url);
             const body = r.ok
@@ -176,7 +195,8 @@ export default function App() {
         }}>Call /api/hello</button>
 
         <button style={{ marginLeft: 8 }} onClick={async () => {
-          const url = `${apiBase}/api/secret?userId=${encodeURIComponent(userId)}&provider=${encodeURIComponent(providerChoice)}`;
+          const provider = backendProviderFor(providerChoice);
+          const url = `${apiBase}/api/secret?userId=${encodeURIComponent(userIdRef.current)}&provider=${encodeURIComponent(provider)}`;
           try {
             const r = await fetchWithTimeout(url);
             const body = r.ok

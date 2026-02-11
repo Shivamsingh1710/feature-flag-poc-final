@@ -1,3 +1,4 @@
+# backend/app.py
 from __future__ import annotations
 
 import os
@@ -19,12 +20,36 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_PATH)
 
+# --- TLS helper: auto-inject certifi CA bundle so HTTPS works in Python on Windows ---
+# --- TLS helper: prefer Windows trust store; fallback to certifi bundle ---
+try:
+    # Use OS trust store if available (best for Windows in corp setups)
+    import truststore  # type: ignore
+    truststore.inject_into_ssl()
+    truststore.inject_into_urllib3()
+    print("[TLS] Using Windows trust store via truststore")
+except Exception as e:
+    print(f"[TLS] truststore unavailable, falling back to certifi: {e}")
+    try:
+        import certifi  # type: ignore
+        ca_path = certifi.where()
+        os.environ.setdefault("SSL_CERT_FILE", ca_path)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_path)
+        print(f"[TLS] Using CA bundle: {ca_path}")
+    except Exception as ee:
+        print(f"[TLS] Warning: could not set certifi CA bundle automatically: {ee}")
+
 # -----------------------------
 # OpenFeature (flagd mode)
 # -----------------------------
 from openfeature import api as openfeature
 from openfeature.evaluation_context import EvaluationContext
 from openfeature.contrib.provider.flagd import FlagdProvider
+
+# -----------------------------
+# Flagsmith server SDK (online)
+# -----------------------------
+from flagsmith import Flagsmith  # pip install flagsmith
 
 # -----------------------------
 # Config
@@ -37,16 +62,19 @@ FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000").rstrip("
 
 BACKEND_PROVIDER = os.getenv("BACKEND_PROVIDER", "flagd").lower().strip()
 
+# LaunchDarkly (file/eval offline)
 LD_SDK_KEY = os.getenv("LD_SDK_KEY", "dummy-offline-sdk-key")
 LD_FLAGS_FILE = os.getenv("LD_FLAGS_FILE", "./launchdarkly/ld-flags.json")
 
-# GrowthBook & Flagsmith files (backend will read these directly)
-GROWTHBOOK_FEATURES_FILE = os.getenv(
-    "GROWTHBOOK_FEATURES_FILE", "growthbook/features.json"
-)
-FLAGSMITH_ENV_FILE = os.getenv(
-    "FLAGSMITH_ENV_FILE", "flagsmith/environment.json"
-)
+# GrowthBook & Flagsmith offline files
+GROWTHBOOK_FEATURES_FILE = os.getenv("GROWTHBOOK_FEATURES_FILE", "growthbook/features.json")
+FLAGSMITH_ENV_FILE = os.getenv("FLAGSMITH_ENV_FILE", "flagsmith/environment.json")
+
+# Flagsmith Online (server-side)
+FLAGSMITH_ENV_KEY = os.getenv("FLAGSMITH_ENV_KEY")  # SECRET: server env key (starts with "ser.")
+FLAGSMITH_API_URL = os.getenv("FLAGSMITH_API_URL")  # optional override (self-hosted or explicit cloud URL)
+FLAGSMITH_TLS_INSECURE = os.getenv("FLAGSMITH_TLS_INSECURE", "false").lower() in {"1", "true", "yes"}
+FLAGSMITH_REQUEST_TIMEOUT_SECONDS = float(os.getenv("FLAGSMITH_REQUEST_TIMEOUT_SECONDS", "3"))
 
 # Normalize file paths to absolute
 def _abs(p: str) -> Path:
@@ -62,15 +90,15 @@ _fs_env_path = _abs(FLAGSMITH_ENV_FILE)
 # -----------------------------
 _of_client = None          # flagd OpenFeature client
 _ld_client = None          # LaunchDarkly client
+_fs_online_client: Optional[Flagsmith] = None  # Flagsmith Online
 
-# Cached docs for GrowthBook/Flagsmith
+# Cached docs for GrowthBook/Flagsmith (offline)
 _gb_doc: Optional[Dict[str, Any]] = None
 _gb_mtime: Optional[float] = None
-
 _fs_doc: Optional[Dict[str, Any]] = None
 _fs_mtime: Optional[float] = None
 
-# For Flagsmith quick lookup (rebuilt when file reloads)
+# For Flagsmith offline quick lookup (rebuilt when file reloads)
 _fs_feature_id_by_name: Dict[str, int] = {}
 _fs_segment_by_id: Dict[int, Dict[str, Any]] = {}
 _fs_states_by_fid: Dict[int, list] = {}
@@ -86,11 +114,8 @@ def build_of_context(user_id: Optional[str]) -> EvaluationContext:
     )
 
 def build_ld_context(user_id: Optional[str]):
-    """
-    Build LaunchDarkly Context for given userId.
-    """
     uid = user_id or "anonymous"
-    from ldclient import Context
+    from ldclient import Context  # type: ignore
     if hasattr(Context, "builder"):
         b = Context.builder(uid)
         b.set("userId", uid)
@@ -100,10 +125,6 @@ def build_ld_context(user_id: Optional[str]):
     raise RuntimeError("LaunchDarkly SDK Context API not found")
 
 def _load_json_with_cache(path: Path, last_mtime: Optional[float]) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
-    """
-    Read a JSON file only if modified (based on mtime).
-    Returns (new_doc_or_None, new_mtime_or_old).
-    """
     if not path.exists():
         raise RuntimeError(f"JSON file not found: {path}")
     mtime = path.stat().st_mtime
@@ -123,28 +144,16 @@ def _init_flagd_openfeature() -> None:
     print(f"[Backend] Provider=flagd ({FLAGD_HOST}:{FLAGD_PORT}, tls={FLAGD_TLS})")
 
 def _init_launchdarkly_file_mode() -> None:
-    """
-    LaunchDarkly local evaluation using file datasource (offline-like).
-    No cloud calls; reads from local JSON file only.
-    """
     global _ld_client
-
     if not _ld_flags_path.exists():
         raise RuntimeError(f"[LaunchDarkly] Flags file not found: {_ld_flags_path}")
-
-    import ldclient
-    from ldclient.config import Config
-    from ldclient.integrations import Files
-
-    file_data_source = Files.new_data_source(
-        paths=[str(_ld_flags_path)],
-        auto_update=True
-    )
-
+    import ldclient  # type: ignore
+    from ldclient.config import Config  # type: ignore
+    from ldclient.integrations import Files  # type: ignore
+    file_data_source = Files.new_data_source(paths=[str(_ld_flags_path)], auto_update=True)
     cfg_kwargs = {"send_events": False}
     sig = inspect.signature(Config.__init__)
     params = sig.parameters
-
     if "update_processor_class" in params:
         cfg_kwargs["update_processor_class"] = file_data_source
     elif "data_source" in params:
@@ -153,8 +162,6 @@ def _init_launchdarkly_file_mode() -> None:
         cfg_kwargs["update_processor"] = file_data_source
     else:
         raise RuntimeError("[LaunchDarkly] Unsupported SDK version: cannot attach file datasource.")
-
-    # Do NOT set offline=True (can force defaults-only behavior in some SDK versions with file source)
     ldclient.set_config(Config(LD_SDK_KEY, **cfg_kwargs))
     _ld_client = ldclient.get()
     if hasattr(_ld_client, "wait_for_initialization"):
@@ -162,8 +169,25 @@ def _init_launchdarkly_file_mode() -> None:
             _ld_client.wait_for_initialization(2)
         except Exception:
             pass
-
     print(f"[Backend] Provider=launchdarkly (file={_ld_flags_path})")
+
+def _init_flagsmith_online() -> None:
+    global _fs_online_client
+    if not FLAGSMITH_ENV_KEY:
+        raise RuntimeError("Flagsmith online: FLAGSMITH_ENV_KEY not set")
+
+    if FLAGSMITH_TLS_INSECURE:
+        # DEMO ONLY: disables TLS verification process-wide for Python requests.
+        os.environ["PYTHONHTTPSVERIFY"] = "0"
+        print("[WARN] Flagsmith-online: PYTHONHTTPSVERIFY=0 (TLS verification disabled)")
+
+    _fs_online_client = Flagsmith(
+        environment_key=FLAGSMITH_ENV_KEY,
+        api_url=FLAGSMITH_API_URL or None,            # NOTE: correct kwarg is api_url
+        enable_local_evaluation=False,                # force online HTTP calls
+        request_timeout_seconds=FLAGSMITH_REQUEST_TIMEOUT_SECONDS,
+    )
+    print(f"[Backend] Provider=flagsmith-online (server SDK, timeout={FLAGSMITH_REQUEST_TIMEOUT_SECONDS}s, insecure={FLAGSMITH_TLS_INSECURE})")
 
 # -----------------------------
 # GrowthBook evaluator (offline JSON)
@@ -182,9 +206,7 @@ def _gb_get_value(flag_key: str, default: Any, user_id: str) -> Any:
     feat = _gb_doc.get(flag_key)
     if not feat:
         return default
-
     attrs = {"userId": user_id}
-    # Rules: [{ "condition": { "userId": "pradyun" }, "force": true }]
     for rule in feat.get("rules", []):
         cond = rule.get("condition", {})
         matched = all(str(attrs.get(k)) == str(v) for k, v in (cond or {}).items())
@@ -230,7 +252,6 @@ def _fs_match_segment(segment: Dict[str, Any], attrs: Dict[str, Any]) -> bool:
                 if str(attrs.get(prop)) != str(val):
                     return False
             else:
-                # unsupported → no match
                 return False
     return True
 
@@ -238,26 +259,19 @@ def _fs_resolve_state(flag_key: str, attrs: Dict[str, Any]) -> Optional[Dict[str
     _fs_reload_if_needed()
     if not _fs_doc:
         return None
-
     fid = _fs_feature_id_by_name.get(flag_key)
     if not fid:
         return None
-
     states = _fs_states_by_fid.get(fid) or []
     if not states:
         return None
-
     matched_seg_ids = []
     for seg_id, seg in _fs_segment_by_id.items():
         if _fs_match_segment(seg, attrs):
             matched_seg_ids.append(seg_id)
-
-    # Prefer segment-specific state in file order
     for st in states:
         if st.get("segment_id") is not None and int(st["segment_id"]) in matched_seg_ids:
             return st
-
-    # Fall back to no-segment state
     for st in states:
         if st.get("segment_id") is None:
             return st
@@ -278,11 +292,42 @@ def _fs_str_from_state(state: Optional[Dict[str, Any]], default: str) -> str:
     return str(state["value"])
 
 # -----------------------------
+# Flagsmith ONLINE evaluators (server SDK) — fail-fast + log
+# -----------------------------
+def _fsm_online_bool(flag_key: str, default: bool, user_id: str) -> bool:
+    if _fs_online_client is None:
+        raise RuntimeError("Flagsmith online client not initialized")
+    try:
+        flags = _fs_online_client.get_identity_flags(
+            identifier=user_id or "anonymous",
+            traits={"userId": user_id or "anonymous"},
+        )
+        v = flags.is_feature_enabled(flag_key)
+        return bool(v) if v is not None else bool(default)
+    except Exception as e:
+        print(f"[Flagsmith-online] bool('{flag_key}') for '{user_id}' failed: {e}")
+        return bool(default)
+
+def _fsm_online_str(flag_key: str, default: str, user_id: str) -> str:
+    if _fs_online_client is None:
+        raise RuntimeError("Flagsmith online client not initialized")
+    try:
+        flags = _fs_online_client.get_identity_flags(
+            identifier=user_id or "anonymous",
+            traits={"userId": user_id or "anonymous"},
+        )
+        v = flags.get_feature_value(flag_key)
+        return str(v) if v is not None else str(default)
+    except Exception as e:
+        print(f"[Flagsmith-online] str('{flag_key}') for '{user_id}' failed: {e}")
+        return str(default)
+
+# -----------------------------
 # Unified evaluators
 # -----------------------------
 def _effective_provider(req_provider: Optional[str]) -> str:
     p = (req_provider or BACKEND_PROVIDER or "flagd").lower().strip()
-    if p not in {"flagd", "launchdarkly", "growthbook", "flagsmith"}:
+    if p not in {"flagd", "launchdarkly", "growthbook", "flagsmith", "flagsmith-online"}:
         p = BACKEND_PROVIDER
     return p
 
@@ -291,23 +336,21 @@ def ff_bool(flag_key: str, default: bool, user_id: str, provider: Optional[str] 
     if p == "launchdarkly":
         if _ld_client is None:
             raise RuntimeError("LaunchDarkly client not initialized")
+        from ldclient import Context  # type: ignore
         ctx = build_ld_context(user_id)
         return bool(_ld_client.variation(flag_key, ctx, default))
-
     if p == "flagd":
         if _of_client is None:
             raise RuntimeError("OpenFeature (flagd) client not initialized")
         ctx = build_of_context(user_id)
         return bool(_of_client.get_boolean_value(flag_key, default, ctx))
-
     if p == "growthbook":
         return bool(_gb_get_value(flag_key, default, user_id))
-
     if p == "flagsmith":
         state = _fs_resolve_state(flag_key, {"userId": user_id})
         return _fs_bool_from_state(state, default)
-
-    # fallback
+    if p == "flagsmith-online":
+        return _fsm_online_bool(flag_key, default, user_id)
     return bool(default)
 
 def ff_str(flag_key: str, default: str, user_id: str, provider: Optional[str] = None) -> str:
@@ -318,21 +361,19 @@ def ff_str(flag_key: str, default: str, user_id: str, provider: Optional[str] = 
         ctx = build_ld_context(user_id)
         v = _ld_client.variation(flag_key, ctx, default)
         return str(v)
-
     if p == "flagd":
         if _of_client is None:
             raise RuntimeError("OpenFeature (flagd) client not initialized")
         ctx = build_of_context(user_id)
         return str(_of_client.get_string_value(flag_key, default, ctx))
-
     if p == "growthbook":
         v = _gb_get_value(flag_key, default, user_id)
         return str(v)
-
     if p == "flagsmith":
         state = _fs_resolve_state(flag_key, {"userId": user_id})
         return _fs_str_from_state(state, default)
-
+    if p == "flagsmith-online":
+        return _fsm_online_str(flag_key, default, user_id)
     return str(default)
 
 # -----------------------------
@@ -340,28 +381,16 @@ def ff_str(flag_key: str, default: str, user_id: str, provider: Optional[str] = 
 # -----------------------------
 app = FastAPI()
 
-app.mount(
-    "/static/growthbook",
-    StaticFiles(directory=BASE_DIR / "growthbook"),
-    name="growthbook-static",
-)
-app.mount(
-    "/static/flagsmith",
-    StaticFiles(directory=BASE_DIR / "flagsmith"),
-    name="flagsmith-static",
-)
+app.mount("/static/growthbook", StaticFiles(directory=BASE_DIR / "growthbook"), name="growthbook-static")
+app.mount("/static/flagsmith", StaticFiles(directory=BASE_DIR / "flagsmith"), name="flagsmith-static")
 
-
-# DEV: open CORS to avoid origin mismatches blocking your button clicks.
-# Once validated, you can revert to [FRONTEND_ORIGIN].
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # <-- permissive for dev
+    allow_origins=["*"],  # permissive for dev
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Simple request logging to confirm the backend is hit when clicking buttons
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     print(f"[HTTP] {request.method} {request.url}")
@@ -373,15 +402,8 @@ async def log_requests(request: Request, call_next):
 
 @app.on_event("startup")
 def startup_init() -> None:
-    """
-    Initialize providers on startup.
-    We'll prep flagd OpenFeature client and LD client so they're ready
-    if chosen per-request. GrowthBook/Flagsmith load lazily on use.
-    """
     global BACKEND_PROVIDER
     BACKEND_PROVIDER = os.getenv("BACKEND_PROVIDER", BACKEND_PROVIDER).lower().strip()
-
-    # Try to init both; don't crash the app if one fails (others still usable)
     try:
         _init_flagd_openfeature()
     except Exception as e:
@@ -390,6 +412,10 @@ def startup_init() -> None:
         _init_launchdarkly_file_mode()
     except Exception as e:
         print(f"[Backend] launchdarkly init warning: {e}")
+    try:
+        _init_flagsmith_online()
+    except Exception as e:
+        print(f"[Backend] flagsmith-online init warning: {e}")
 
 # -----------------------------
 # Routes (provider-aware)
@@ -405,6 +431,12 @@ def healthz(provider: Optional[str] = None) -> dict:
         "ldFlagsFile": str(_ld_flags_path) if p == "launchdarkly" else None,
         "growthbookFile": str(_gb_features_path) if p == "growthbook" else None,
         "flagsmithFile": str(_fs_env_path) if p == "flagsmith" else None,
+        "flagsmithOnline": (p == "flagsmith-online"),
+        "tls": {
+            "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE"),
+            "REQUESTS_CA_BUNDLE": os.environ.get("REQUESTS_CA_BUNDLE"),
+            "PYTHONHTTPSVERIFY": os.environ.get("PYTHONHTTPSVERIFY"),
+        },
     }
 
 @app.get("/api/flags")
@@ -433,3 +465,52 @@ def secret(userId: str = "anonymous", provider: Optional[str] = None) -> dict:
     if not allowed:
         raise HTTPException(status_code=403, detail="Feature disabled by flag")
     return {"secret": "🍪 super secret data"}
+
+# Optional: quick diagnostic to probe flagsmith-online
+@app.get("/api/diag/flagsmith-online")
+def diag_flagsmith_online(userId: str = "anonymous") -> dict:
+    try:
+        b = _fsm_online_bool("new-badge", False, userId)
+        s = _fsm_online_str("cta-color", "blue", userId)
+        a = _fsm_online_bool("api-new-endpoint-enabled", False, userId)
+        return {"ok": True, "newBadge": b, "ctaColor": s, "apiNewEndpointEnabled": a}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# --- RAW diagnostic for Flagsmith Online HTTP (correct header) ---
+import requests
+
+@app.get("/api/diag/flagsmith-online-raw")
+def diag_flagsmith_online_raw(userId: str = "anonymous") -> dict:
+    base = (FLAGSMITH_API_URL or "https://edge.api.flagsmith.com/api/v1/").rstrip("/")
+    url = f"{base}/identities/"
+    headers = {
+        # Flagsmith API expects the environment key in this header for server-side calls
+        "X-Environment-Key": (FLAGSMITH_ENV_KEY or "").strip(),
+        "Content-Type": "application/json",
+    }
+    body = {
+        "identifier": userId or "anonymous",
+        "traits": [{"trait_key": "userId", "trait_value": userId or "anonymous"}],
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=FLAGSMITH_REQUEST_TIMEOUT_SECONDS)
+        # Try to parse JSON body; fall back to text
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = resp.text[:2000]
+        return {
+            "url": url,
+            "status": resp.status_code,
+            "ok": resp.ok,
+            "headers": dict(resp.headers),
+            "body": parsed,
+            "sent_headers": {"X-Environment-Key_present": bool(headers["X-Environment-Key"])},
+        }
+    except Exception as e:
+        return {
+            "url": url,
+            "error": repr(e),
+            "sent_headers": {"X-Environment-Key_present": bool(headers["X-Environment-Key"])},
+        }

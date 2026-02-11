@@ -5,3 +5,4 @@ openfeature-sdk
 openfeature-provider-flagd
 launchdarkly-server-sdk
 python-dotenv
+flagsmith
