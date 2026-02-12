@@ -5,6 +5,7 @@ import { initOpenFeature, reinitOpenFeature } from './openfeature';
 import { reloadGrowthBookFeatures } from './providers/growthbook';
 import { reloadFlagsmithEnvironment } from './providers/flagsmith';
 import { refreshFlagsmithOnline } from './providers/flagsmith_online';
+import { refreshLaunchDarklyOnline } from './providers/launchdarkly_online';
 
 export default function App() {
   const [userId, setUserId] = useState('anonymous');
@@ -19,6 +20,8 @@ export default function App() {
   const backendProviderFor = (choice) => {
     if (choice === 'flagsmith-online') return 'flagsmith-online';
     if (choice === 'flagsmith-offline') return 'flagsmith';
+    if (choice === 'launchdarkly-online') return 'launchdarkly-online';
+    // GrowthBook offline uses 'growthbook'
     return choice;
   };
 
@@ -62,6 +65,8 @@ export default function App() {
       await reloadFlagsmithEnvironment();
     } else if (providerChoice === 'flagsmith-online') {
       await refreshFlagsmithOnline();
+    } else if (providerChoice === 'launchdarkly-online') {
+      await refreshLaunchDarklyOnline();
     }
 
     await OpenFeature.setContext({ targetingKey: userIdRef.current, userId: userIdRef.current });

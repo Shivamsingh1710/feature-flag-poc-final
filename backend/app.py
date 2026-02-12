@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import inspect
 import json
+import time
+import hashlib
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
@@ -66,8 +68,18 @@ BACKEND_PROVIDER = os.getenv("BACKEND_PROVIDER", "flagd").lower().strip()
 LD_SDK_KEY = os.getenv("LD_SDK_KEY", "dummy-offline-sdk-key")
 LD_FLAGS_FILE = os.getenv("LD_FLAGS_FILE", "./launchdarkly/ld-flags.json")
 
-# GrowthBook & Flagsmith offline files
+# LaunchDarkly ONLINE (server SDK)
+LD_ONLINE_SDK_KEY = os.getenv("LD_ONLINE_SDK_KEY")  # real server SDK key (keep secret)
+LD_ONLINE_BASE_URI = os.getenv("LD_ONLINE_BASE_URI")  # optional (relay proxy URI)
+LD_ONLINE_STREAM_URI = os.getenv("LD_ONLINE_STREAM_URI")  # optional
+LD_ONLINE_EVENTS_URI = os.getenv("LD_ONLINE_EVENTS_URI")  # optional
+LD_ONLINE_INIT_TIMEOUT_SECONDS = float(os.getenv("LD_ONLINE_INIT_TIMEOUT_SECONDS", "3"))
+LD_ONLINE_SEND_EVENTS = os.getenv("LD_ONLINE_SEND_EVENTS", "false").lower() in {"1", "true", "yes"}
+
+# GrowthBook (offline file)
 GROWTHBOOK_FEATURES_FILE = os.getenv("GROWTHBOOK_FEATURES_FILE", "growthbook/features.json")
+
+# Flagsmith (offline file)
 FLAGSMITH_ENV_FILE = os.getenv("FLAGSMITH_ENV_FILE", "flagsmith/environment.json")
 
 # Flagsmith Online (server-side)
@@ -89,7 +101,11 @@ _fs_env_path = _abs(FLAGSMITH_ENV_FILE)
 # Globals initialized at startup
 # -----------------------------
 _of_client = None          # flagd OpenFeature client
-_ld_client = None          # LaunchDarkly client
+
+# IMPORTANT: Separate LD clients (no singleton)
+_ld_client = None          # LaunchDarkly client (file/offline)
+_ld_online_client = None   # LaunchDarkly client (online/server)
+
 _fs_online_client: Optional[Flagsmith] = None  # Flagsmith Online
 
 # Cached docs for GrowthBook/Flagsmith (offline)
@@ -133,6 +149,13 @@ def _load_json_with_cache(path: Path, last_mtime: Optional[float]) -> Tuple[Opti
             return json.load(f), mtime
     return None, last_mtime
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 # -----------------------------
 # Provider wiring
 # -----------------------------
@@ -144,32 +167,85 @@ def _init_flagd_openfeature() -> None:
     print(f"[Backend] Provider=flagd ({FLAGD_HOST}:{FLAGD_PORT}, tls={FLAGD_TLS})")
 
 def _init_launchdarkly_file_mode() -> None:
+    """
+    Initialize a dedicated LaunchDarkly client with the Files data source (auto-update).
+    Avoid the global singleton to prevent being overridden by LD online init.
+    """
     global _ld_client
+
     if not _ld_flags_path.exists():
         raise RuntimeError(f"[LaunchDarkly] Flags file not found: {_ld_flags_path}")
+
+    # Imports
     import ldclient  # type: ignore
+    from ldclient import LDClient  # type: ignore
     from ldclient.config import Config  # type: ignore
     from ldclient.integrations import Files  # type: ignore
+
     file_data_source = Files.new_data_source(paths=[str(_ld_flags_path)], auto_update=True)
-    cfg_kwargs = {"send_events": False}
+
+    cfg_kwargs: Dict[str, Any] = {"send_events": False}
     sig = inspect.signature(Config.__init__)
     params = sig.parameters
-    if "update_processor_class" in params:
-        cfg_kwargs["update_processor_class"] = file_data_source
-    elif "data_source" in params:
+
+    # Prefer modern param 'data_source' if present
+    if "data_source" in params:
         cfg_kwargs["data_source"] = file_data_source
+        param_used = "data_source"
+    # Else try legacy names
+    elif "update_processor_class" in params:
+        cfg_kwargs["update_processor_class"] = file_data_source
+        param_used = "update_processor_class"
     elif "update_processor" in params:
         cfg_kwargs["update_processor"] = file_data_source
+        param_used = "update_processor"
     else:
-        raise RuntimeError("[LaunchDarkly] Unsupported SDK version: cannot attach file datasource.")
-    ldclient.set_config(Config(LD_SDK_KEY, **cfg_kwargs))
-    _ld_client = ldclient.get()
+        raise RuntimeError("[LaunchDarkly] Unsupported SDK version: cannot attach file data source")
+
+    config = Config(LD_SDK_KEY, **cfg_kwargs)
+    _ld_client = LDClient(config)
+
+    # Initial wait (non-fatal on timeout)
     if hasattr(_ld_client, "wait_for_initialization"):
         try:
             _ld_client.wait_for_initialization(2)
         except Exception:
             pass
-    print(f"[Backend] Provider=launchdarkly (file={_ld_flags_path})")
+
+    print(f"[Backend] Provider=launchdarkly (file={_ld_flags_path}, auto_update=True, via {param_used})")
+
+def _init_launchdarkly_online() -> None:
+    """
+    Initialize a separate LaunchDarkly Server SDK client in ONLINE mode (streaming/polling).
+    """
+    global _ld_online_client
+    if not LD_ONLINE_SDK_KEY:
+        raise RuntimeError("LaunchDarkly online: LD_ONLINE_SDK_KEY not set")
+
+    import ldclient  # type: ignore
+    from ldclient import LDClient  # type: ignore
+    from ldclient.config import Config  # type: ignore
+
+    cfg_kwargs: Dict[str, Any] = {
+        "send_events": LD_ONLINE_SEND_EVENTS,
+    }
+    # Optional relay proxy URIs
+    if LD_ONLINE_BASE_URI:
+        cfg_kwargs["base_uri"] = LD_ONLINE_BASE_URI
+    if LD_ONLINE_STREAM_URI:
+        cfg_kwargs["stream_uri"] = LD_ONLINE_STREAM_URI
+    if LD_ONLINE_EVENTS_URI:
+        cfg_kwargs["events_uri"] = LD_ONLINE_EVENTS_URI
+
+    config = Config(LD_ONLINE_SDK_KEY, **cfg_kwargs)
+    _ld_online_client = LDClient(config)
+
+    if hasattr(_ld_online_client, "wait_for_initialization"):
+        try:
+            _ld_online_client.wait_for_initialization(LD_ONLINE_INIT_TIMEOUT_SECONDS)
+        except Exception as e:
+            print(f"[Backend] LaunchDarkly online init wait failed: {e}")
+    print("[Backend] Provider=launchdarkly-online (server SDK)")
 
 def _init_flagsmith_online() -> None:
     global _fs_online_client
@@ -190,7 +266,7 @@ def _init_flagsmith_online() -> None:
     print(f"[Backend] Provider=flagsmith-online (server SDK, timeout={FLAGSMITH_REQUEST_TIMEOUT_SECONDS}s, insecure={FLAGSMITH_TLS_INSECURE})")
 
 # -----------------------------
-# GrowthBook evaluator (offline JSON)
+# GrowthBook evaluators (offline file)
 # -----------------------------
 def _gb_reload_if_needed() -> None:
     global _gb_doc, _gb_mtime
@@ -327,7 +403,14 @@ def _fsm_online_str(flag_key: str, default: str, user_id: str) -> str:
 # -----------------------------
 def _effective_provider(req_provider: Optional[str]) -> str:
     p = (req_provider or BACKEND_PROVIDER or "flagd").lower().strip()
-    if p not in {"flagd", "launchdarkly", "growthbook", "flagsmith", "flagsmith-online"}:
+    if p not in {
+        "flagd",
+        "launchdarkly",
+        "launchdarkly-online",
+        "growthbook",
+        "flagsmith",
+        "flagsmith-online",
+    }:
         p = BACKEND_PROVIDER
     return p
 
@@ -335,10 +418,14 @@ def ff_bool(flag_key: str, default: bool, user_id: str, provider: Optional[str] 
     p = _effective_provider(provider)
     if p == "launchdarkly":
         if _ld_client is None:
-            raise RuntimeError("LaunchDarkly client not initialized")
-        from ldclient import Context  # type: ignore
+            raise RuntimeError("LaunchDarkly (file mode) client not initialized")
         ctx = build_ld_context(user_id)
         return bool(_ld_client.variation(flag_key, ctx, default))
+    if p == "launchdarkly-online":
+        if _ld_online_client is None:
+            raise RuntimeError("LaunchDarkly online client not initialized")
+        ctx = build_ld_context(user_id)
+        return bool(_ld_online_client.variation(flag_key, ctx, default))
     if p == "flagd":
         if _of_client is None:
             raise RuntimeError("OpenFeature (flagd) client not initialized")
@@ -357,9 +444,15 @@ def ff_str(flag_key: str, default: str, user_id: str, provider: Optional[str] = 
     p = _effective_provider(provider)
     if p == "launchdarkly":
         if _ld_client is None:
-            raise RuntimeError("LaunchDarkly client not initialized")
+            raise RuntimeError("LaunchDarkly (file mode) client not initialized")
         ctx = build_ld_context(user_id)
         v = _ld_client.variation(flag_key, ctx, default)
+        return str(v)
+    if p == "launchdarkly-online":
+        if _ld_online_client is None:
+            raise RuntimeError("LaunchDarkly online client not initialized")
+        ctx = build_ld_context(user_id)
+        v = _ld_online_client.variation(flag_key, ctx, default)
         return str(v)
     if p == "flagd":
         if _of_client is None:
@@ -411,7 +504,11 @@ def startup_init() -> None:
     try:
         _init_launchdarkly_file_mode()
     except Exception as e:
-        print(f"[Backend] launchdarkly init warning: {e}")
+        print(f"[Backend] launchdarkly (file) init warning: {e}")
+    try:
+        _init_launchdarkly_online()
+    except Exception as e:
+        print(f"[Backend] launchdarkly-online init warning: {e}")
     try:
         _init_flagsmith_online()
     except Exception as e:
@@ -429,6 +526,7 @@ def healthz(provider: Optional[str] = None) -> dict:
         "effectiveProvider": p,
         "frontendOrigin": FRONTEND_ORIGIN,
         "ldFlagsFile": str(_ld_flags_path) if p == "launchdarkly" else None,
+        "ldOnline": (p == "launchdarkly-online"),
         "growthbookFile": str(_gb_features_path) if p == "growthbook" else None,
         "flagsmithFile": str(_fs_env_path) if p == "flagsmith" else None,
         "flagsmithOnline": (p == "flagsmith-online"),
@@ -437,6 +535,10 @@ def healthz(provider: Optional[str] = None) -> dict:
             "REQUESTS_CA_BUNDLE": os.environ.get("REQUESTS_CA_BUNDLE"),
             "PYTHONHTTPSVERIFY": os.environ.get("PYTHONHTTPSVERIFY"),
         },
+        "ldFile": {
+            "path": str(_ld_flags_path) if p == "launchdarkly" else None,
+            "mtime": (_ld_flags_path.stat().st_mtime if _ld_flags_path.exists() and p == "launchdarkly" else None),
+        }
     }
 
 @app.get("/api/flags")
@@ -466,7 +568,11 @@ def secret(userId: str = "anonymous", provider: Optional[str] = None) -> dict:
         raise HTTPException(status_code=403, detail="Feature disabled by flag")
     return {"secret": "🍪 super secret data"}
 
-# Optional: quick diagnostic to probe flagsmith-online
+# --- Diagnostics ---
+
+# Flagsmith ONLINE diag (kept)
+import requests
+
 @app.get("/api/diag/flagsmith-online")
 def diag_flagsmith_online(userId: str = "anonymous") -> dict:
     try:
@@ -477,15 +583,11 @@ def diag_flagsmith_online(userId: str = "anonymous") -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# --- RAW diagnostic for Flagsmith Online HTTP (correct header) ---
-import requests
-
 @app.get("/api/diag/flagsmith-online-raw")
 def diag_flagsmith_online_raw(userId: str = "anonymous") -> dict:
     base = (FLAGSMITH_API_URL or "https://edge.api.flagsmith.com/api/v1/").rstrip("/")
     url = f"{base}/identities/"
     headers = {
-        # Flagsmith API expects the environment key in this header for server-side calls
         "X-Environment-Key": (FLAGSMITH_ENV_KEY or "").strip(),
         "Content-Type": "application/json",
     }
@@ -495,7 +597,6 @@ def diag_flagsmith_online_raw(userId: str = "anonymous") -> dict:
     }
     try:
         resp = requests.post(url, headers=headers, json=body, timeout=FLAGSMITH_REQUEST_TIMEOUT_SECONDS)
-        # Try to parse JSON body; fall back to text
         try:
             parsed = resp.json()
         except Exception:
@@ -514,3 +615,54 @@ def diag_flagsmith_online_raw(userId: str = "anonymous") -> dict:
             "error": repr(e),
             "sent_headers": {"X-Environment-Key_present": bool(headers["X-Environment-Key"])},
         }
+
+# LaunchDarkly ONLINE diag
+@app.get("/api/diag/launchdarkly-online")
+def diag_launchdarkly_online(userId: str = "anonymous") -> dict:
+    try:
+        if _ld_online_client is None:
+            return {"ok": False, "error": "launchdarkly online client not initialized"}
+        ctx = build_ld_context(userId)
+        b = bool(_ld_online_client.variation("new-badge", ctx, False))
+        s = str(_ld_online_client.variation("cta-color", ctx, "blue"))
+        a = bool(_ld_online_client.variation("api-new-endpoint-enabled", ctx, False))
+        return {
+            "ok": True,
+            "sample": {"newBadge": b, "ctaColor": s, "apiNewEndpointEnabled": a},
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# LaunchDarkly FILE diag – backend eval using file mode
+@app.get("/api/diag/launchdarkly-file")
+def diag_launchdarkly_file(userId: str = "anonymous") -> dict:
+    try:
+        if _ld_client is None:
+            return {"ok": False, "error": "launchdarkly file-mode client not initialized"}
+        ctx = build_ld_context(userId)
+        b = bool(_ld_client.variation("new-badge", ctx, False))
+        s = str(_ld_client.variation("cta-color", ctx, "blue"))
+        a = bool(_ld_client.variation("api-new-endpoint-enabled", ctx, False))
+        info = {
+            "file_path": str(_ld_flags_path),
+            "file_exists": _ld_flags_path.exists(),
+            "file_mtime": (_ld_flags_path.stat().st_mtime if _ld_flags_path.exists() else None),
+        }
+        return {"ok": True, "info": info, "sample": {"newBadge": b, "ctaColor": s, "apiNewEndpointEnabled": a}}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# LaunchDarkly FILE diag – mtime + sha256 to confirm actual on-disk changes
+@app.get("/api/diag/launchdarkly-file-hash")
+def diag_launchdarkly_file_hash() -> dict:
+    try:
+        exists = _ld_flags_path.exists()
+        return {
+            "ok": True,
+            "path": str(_ld_flags_path),
+            "exists": exists,
+            "mtime": (_ld_flags_path.stat().st_mtime if exists else None),
+            "sha256": (_sha256_file(_ld_flags_path) if exists else None),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
